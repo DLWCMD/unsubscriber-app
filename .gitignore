@@ -1,0 +1,6 @@
+# Ignore Google OAuth credential files
+client_secret.json
+token.json
+
+# Ignore Mac-specific system files
+.DS_Store
