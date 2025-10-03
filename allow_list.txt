@@ -1,0 +1,3 @@
+allowlist1
+allowlist@test.com
+whytryai@substack.com

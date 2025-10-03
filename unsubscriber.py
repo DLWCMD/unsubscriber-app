@@ -34,11 +34,7 @@ def get_gmail_service():
     creds = authenticate()
     return build("gmail", "v1", credentials=creds)
 
-def find_emails_to_process(service):
-    allow_list = []
-    if os.path.exists(ALLOW_LIST_FILE):
-        with open(ALLOW_LIST_FILE, "r") as f:
-            allow_list = [line.strip() for line in f.readlines()]
+def find_emails_to_process(service, allow_list):
     results = service.users().messages().list(userId="me", labelIds=['INBOX'], q="").execute()
     messages = results.get("messages", [])
     emails_to_process = []
@@ -74,14 +70,20 @@ def get_unsubscribe_mailto(header_value):
     match = re.search(r'<mailto:(.*?)>', header_value)
     return match.group(1) if match else None
 
+def read_allow_list_file():
+    if not os.path.exists(ALLOW_LIST_FILE): return []
+    with open(ALLOW_LIST_FILE, "r") as f:
+        return sorted([line.strip() for line in f if line.strip()])
+
+def write_allow_list_file(entries):
+    with open(ALLOW_LIST_FILE, "w") as f:
+        for entry in sorted(set(entries)): f.write(entry + "\n")
+
 # --- Flet UI Application ---
 def main(page: ft.Page):
     page.title = "Unsubscriber"
-    page.vertical_alignment = ft.MainAxisAlignment.START
-    page.scroll = ft.ScrollMode.ADAPTIVE
-    
     gmail_service = get_gmail_service()
-
+    
     def update_ui_remove_card(card_to_remove):
         emails_view.controls.remove(card_to_remove)
         page.update()
@@ -91,20 +93,17 @@ def main(page: ft.Page):
             button.text = "Sending..."
             button.disabled = True
             page.update()
-            
             send_unsubscribe_email(gmail_service, mailto_link)
-            
             button.text = "Unsubscribed ✓"
             button.icon = ft.Icons.CHECK
             button.bgcolor = ft.Colors.GREEN_200
-            button.disabled = True
-            page.update()
         except Exception as e:
             button.text = "Error"
             button.bgcolor = ft.Colors.RED_400
+            print(f"Error during unsubscribe: {e}")
+        finally:
             button.disabled = True
             page.update()
-            print(f"Error during unsubscribe: {e}")
 
     def scan_button_clicked(e):
         progress_bar.visible = True
@@ -112,7 +111,9 @@ def main(page: ft.Page):
         emails_view.controls.clear()
         page.update()
         try:
-            emails = find_emails_to_process(gmail_service)
+            current_allow_list = [control.value for control in allow_list_view.controls]
+            emails = find_emails_to_process(gmail_service, current_allow_list)
+            
             progress_bar.visible = False
             scan_button.disabled = False
             if not emails:
@@ -120,41 +121,24 @@ def main(page: ft.Page):
             else:
                 for email in emails:
                     card = ft.Card()
+                    action_button = ft.ElevatedButton()
                     
                     if email['mailto_link']:
-                        action_button = ft.ElevatedButton(
-                            "Unsubscribe",
-                            bgcolor=ft.Colors.RED_200,
-                        )
-                        action_button.on_click = lambda _, b=action_button, m=email['mailto_link'], c=card: page.run_thread(
-                            unsubscribe_background_task, b, m, c
-                        )
+                        action_button.text = "Unsubscribe"
+                        action_button.bgcolor = ft.Colors.RED_200
+                        action_button.on_click = lambda _, b=action_button, m=email['mailto_link'], c=card: page.run_thread(unsubscribe_background_task, b, m, c)
                     else:
-                        # --- THIS BLOCK IS THE KEY CHANGE ---
-                        action_button = ft.ElevatedButton(
-                            "Manual Only",
-                            # The button is no longer disabled
-                            # It now has an on_click action to open the email
-                            on_click=lambda _, url=f"https://mail.google.com/mail/u/0/#inbox/{email['id']}": webbrowser.open_new_tab(url)
-                        )
+                        action_button.text = "Open to Unsubscribe"
+                        action_button.on_click = lambda _, url=f"https://mail.google.com/mail/u/0/#inbox/{email['id']}": webbrowser.open_new_tab(url)
                     
-                    card.content = ft.Container(
-                        padding=10,
-                        content=ft.Row(
-                            controls=[
-                                ft.Column(
-                                    [
-                                        ft.Text(f"From: {email['sender']}", weight=ft.FontWeight.BOLD),
-                                        ft.Text(f"Subject: {email['subject']}"),
-                                    ],
-                                    expand=True,
-                                ),
-                                ft.ElevatedButton("Open", on_click=lambda _, url=f"https://mail.google.com/mail/u/0/#inbox/{email['id']}": webbrowser.open_new_tab(url)),
-                                ft.ElevatedButton("Skip", data=card, on_click=lambda e: update_ui_remove_card(e.control.data)),
-                                action_button, # Use the button we defined above
-                            ]
-                        )
-                    )
+                    card.content = ft.Container(padding=10, content=ft.Row(controls=[
+                        ft.Column([
+                            ft.Text(f"From: {email['sender']}", weight=ft.FontWeight.BOLD),
+                            ft.Text(f"Subject: {email['subject']}"),
+                        ], expand=True),
+                        ft.ElevatedButton("Skip", data=card, on_click=lambda e: update_ui_remove_card(e.control.data)),
+                        action_button,
+                    ]))
                     emails_view.controls.append(card)
         except Exception as e:
             progress_bar.visible = False
@@ -162,19 +146,42 @@ def main(page: ft.Page):
             emails_view.controls.append(ft.Text(f"An error occurred during scan: {e}"))
         page.update()
 
-    title = ft.Text("📬 UNSUBSCRIBER", size=30, weight=ft.FontWeight.BOLD)
-    subtitle = ft.Text("A smart tool to help manage your email subscriptions.")
-    scan_button = ft.ElevatedButton("Scan for Emails to Unsubscribe", on_click=scan_button_clicked)
+    scan_button = ft.ElevatedButton("Scan for Emails", on_click=scan_button_clicked)
     progress_bar = ft.ProgressBar(width=400, visible=False)
     emails_view = ft.Column(spacing=10, scroll=ft.ScrollMode.ADAPTIVE, expand=True)
 
+    def add_to_allow_list_clicked(e):
+        new_entry = new_entry_field.value
+        if new_entry and not any(isinstance(c, ft.Text) and c.value == new_entry for c in allow_list_view.controls):
+            allow_list_view.controls.append(ft.Text(new_entry))
+            new_entry_field.value = ""
+            save_allow_list_clicked(e)
+            page.update()
+
+    def save_allow_list_clicked(e):
+        current_entries = [control.value for control in allow_list_view.controls if isinstance(control, ft.Text)]
+        write_allow_list_file(current_entries)
+        page.snack_bar = ft.SnackBar(content=ft.Text("Allow list saved!"), open=True)
+        page.update()
+
+    new_entry_field = ft.TextField(label="Add new email or domain", expand=True)
+    add_button = ft.ElevatedButton("Add", on_click=add_to_allow_list_clicked)
+    save_button = ft.ElevatedButton("Save List", on_click=save_allow_list_clicked)
+    allow_list_view = ft.ListView([ft.Text(entry) for entry in read_allow_list_file()], expand=True, spacing=5)
+
     page.add(
-        title,
-        subtitle,
-        scan_button,
-        progress_bar,
-        ft.Divider(),
-        ft.Container(content=emails_view, expand=True),
+        ft.Text("📬 UNSUBSCRIBER", size=30, weight=ft.FontWeight.BOLD),
+        ft.Tabs(
+            selected_index=0,
+            tabs=[
+                ft.Tab(text="To Process", icon=ft.Icons.MAIL, content=ft.Container(content=ft.Column([
+                    scan_button, progress_bar, ft.Divider(), ft.Container(content=emails_view, expand=True)
+                ]), padding=10)),
+                ft.Tab(text="Allow List", icon=ft.Icons.VERIFIED_USER_OUTLINED, content=ft.Container(content=ft.Column([
+                    ft.Row([new_entry_field, add_button]), save_button, ft.Divider(), allow_list_view
+                ]), padding=10, expand=True)),
+            ], expand=True,
+        ),
     )
 
 if __name__ == "__main__":
